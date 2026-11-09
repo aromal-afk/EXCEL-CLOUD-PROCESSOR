@@ -1,0 +1,58 @@
+
+.container {
+  max-width: 850px;
+  margin: 60px auto;
+  padding: 24px;
+  font-family: Arial, sans-serif;
+}
+
+h1 {
+  margin-bottom: 8px;
+}
+
+.upload-card {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  padding: 30px;
+  margin-top: 30px;
+  border: 1px solid #ddd;
+  border-radius: 12px;
+}
+
+button {
+  padding: 12px 20px;
+  background: #2563eb;
+  color: white;
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.results {
+  margin-top: 30px;
+}
+
+.result-item {
+  display: flex;
+  justify-content: space-between;
+  gap: 20px;
+  padding: 16px;
+  border-bottom: 1px solid #ddd;
+}
+
+.result-item small {
+  display: block;
+  margin-top: 6px;
+  color: #666;
+  overflow-wrap: anywhere;
+}
+
+.error {
+  color: #dc2626 !important;
+}
