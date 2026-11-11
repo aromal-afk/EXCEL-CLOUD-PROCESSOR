@@ -1,83 +1,101 @@
-
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import "./App.css";
 
-import {
-  createJob,
-  uploadToGCS,
-  confirmUpload,
-  getJobs,
-  getJobStatus,
-  getErrorReportUrl,
-} from "./services/api";
+import { createJob, uploadToGCS, confirmUpload } from "./services/api";
+import { fileKey } from "./utils/formatting";
+import { useJobHistory } from "./hooks/useJobHistory";
+import DropZone from "./components/DropZone";
+import JobList from "./components/JobList";
 
 function App() {
   const [files, setFiles] = useState([]);
+  const [dragActive, setDragActive] = useState(false);
+  const [selectionNotice, setSelectionNotice] = useState("");
   const [uploading, setUploading] = useState(false);
-  const [results, setResults] = useState([]);
-  const [loadingHistory, setLoadingHistory] = useState(true);
-  const [historyError, setHistoryError] = useState("");
 
-  // Convert Firestore job data into frontend format.
-  const normalizeJob = (job) => ({
-    jobId: job.job_id,
-    filename: job.filename || "Unknown file",
-    status: job.status || "Unknown",
-    validRows: job.valid_rows ?? null,
-    invalidRows: job.invalid_rows ?? null,
-    savedRecords: job.saved_records ?? null,
-    errorReportAvailable: Boolean(
-      job.error_report_object_name
-    ),
-    refreshing: false,
-    downloading: false,
-    error: null,
-  });
+  const {
+    results,
+    setResults,
+    loadingHistory,
+    historyError,
+    loadJobHistory,
+    updateResult,
+    handleRefreshStatus,
+    handleDownloadErrors,
+  } = useJobHistory();
 
-  // Update a job using its unique job ID.
-  const updateResult = (jobId, changes) => {
-    setResults((previous) =>
-      previous.map((result) =>
-        result.jobId === jobId
-          ? { ...result, ...changes }
-          : result
-      )
+  // ── File selection helpers ──────────────────────────────────────────────────
+
+  const addFiles = (fileList) => {
+    const incoming = Array.from(fileList);
+    const excel = incoming.filter((file) =>
+      file.name.toLowerCase().endsWith(".xlsx")
     );
+    const skipped = incoming.length - excel.length;
+
+    setSelectionNotice(
+      skipped
+        ? `${skipped} file${skipped > 1 ? "s were" : " was"} skipped. Only .xlsx files are supported.`
+        : ""
+    );
+
+    setFiles((previous) => {
+      const existing = new Set(previous.map((item) => item.id));
+      const additions = excel
+        .map((file) => ({ id: fileKey(file), file }))
+        .filter((item) => !existing.has(item.id));
+
+      return [...previous, ...additions];
+    });
   };
-
-  // Fetch saved jobs from Firestore through FastAPI.
-  const loadJobHistory = async () => {
-    setLoadingHistory(true);
-    setHistoryError("");
-
-    try {
-      const jobs = await getJobs();
-      setResults(jobs.map(normalizeJob));
-    } catch (error) {
-      setHistoryError(error.message);
-    } finally {
-      setLoadingHistory(false);
-    }
-  };
-
-  // Automatically restore history when React loads.
-  useEffect(() => {
-    loadJobHistory();
-  }, []);
 
   const handleFileChange = (event) => {
-    setFiles(Array.from(event.target.files));
+    addFiles(event.target.files);
+    // Allow the same file to be picked again after removal.
+    event.target.value = "";
   };
+
+  const handleRemoveFile = (id) => {
+    setFiles((previous) => previous.filter((item) => item.id !== id));
+  };
+
+  const handleClearFiles = () => {
+    setFiles([]);
+    setSelectionNotice("");
+  };
+
+  // ── Drag-and-drop handlers ──────────────────────────────────────────────────
+
+  const handleDragOver = (event) => {
+    event.preventDefault();
+    if (!uploading) setDragActive(true);
+  };
+
+  const handleDragLeave = (event) => {
+    event.preventDefault();
+    setDragActive(false);
+  };
+
+  const handleDrop = (event) => {
+    event.preventDefault();
+    setDragActive(false);
+    if (uploading) return;
+    addFiles(event.dataTransfer.files);
+  };
+
+  // ── Upload sequence ─────────────────────────────────────────────────────────
 
   const handleUpload = async () => {
     if (!files.length || uploading) return;
 
     setUploading(true);
+    setSelectionNotice("");
 
     await Promise.all(
-      files.map(async (file) => {
+      files.map(async ({ file }) => {
         const temporaryId = crypto.randomUUID();
 
+        // Insert a placeholder row immediately so the user sees progress.
         setResults((previous) => [
           {
             jobId: temporaryId,
@@ -95,15 +113,11 @@ function App() {
           const job = await createJob(file.name);
           currentId = job.job_id;
 
+          // Replace the temporary placeholder with the real job ID.
           setResults((previous) =>
             previous.map((result) =>
               result.jobId === temporaryId
-                ? {
-                    ...result,
-                    jobId: job.job_id,
-                    status: "Uploading",
-                    isTemporary: false,
-                  }
+                ? { ...result, jobId: job.job_id, status: "Uploading", isTemporary: false }
                 : result
             )
           );
@@ -111,25 +125,27 @@ function App() {
           await uploadToGCS(
             file,
             job.upload_url,
-            job.upload_content_type
+            job.upload_content_type,
+            // Show "Uploading (retry N/M)…" in the UI on each retry.
+            (attempt, max) => {
+              if (attempt > 1) {
+                updateResult(currentId, {
+                  status: `Uploading (retry ${attempt}/${max})`,
+                });
+              }
+            }
           );
 
-          updateResult(currentId, {
-            status: "Confirming upload",
-          });
+          const uploadFinishedAt = Date.now();
+          updateResult(currentId, { status: "Confirming upload", uploadFinishedAt });
 
-          const confirmation = await confirmUpload(
-            job.job_id
-          );
-
+          const confirmation = await confirmUpload(job.job_id);
           updateResult(currentId, {
             status: confirmation.status || "Queued",
+            pollable: true,
           });
         } catch (error) {
-          updateResult(currentId, {
-            status: "Failed",
-            error: error.message,
-          });
+          updateResult(currentId, { status: "Failed", error: error.message });
         }
       })
     );
@@ -141,172 +157,40 @@ function App() {
     await loadJobHistory();
   };
 
-  const handleRefreshStatus = async (jobId) => {
-    updateResult(jobId, {
-      refreshing: true,
-      error: null,
-    });
-
-    try {
-      const job = await getJobStatus(jobId);
-
-      updateResult(jobId, {
-        status: job.status || "Unknown",
-        validRows: job.valid_rows ?? null,
-        invalidRows: job.invalid_rows ?? null,
-        savedRecords: job.saved_records ?? null,
-        errorReportAvailable: Boolean(
-          job.error_report_object_name
-        ),
-      });
-    } catch (error) {
-      updateResult(jobId, {
-        error: error.message,
-      });
-    } finally {
-      updateResult(jobId, {
-        refreshing: false,
-      });
-    }
-  };
-
-  const handleDownloadErrors = async (jobId) => {
-    updateResult(jobId, {
-      downloading: true,
-      error: null,
-    });
-
-    try {
-      const downloadUrl = await getErrorReportUrl(jobId);
-
-      // Navigate to the temporary signed download URL.
-      window.location.assign(downloadUrl);
-    } catch (error) {
-      updateResult(jobId, {
-        error: error.message,
-      });
-    } finally {
-      updateResult(jobId, {
-        downloading: false,
-      });
-    }
-  };
+  // ── Render ──────────────────────────────────────────────────────────────────
 
   return (
     <main className="container">
-      <h1>Bulk Excel Processor</h1>
+      <header className="page-header">
+        <h1>Bulk Excel Processor</h1>
+        <p className="subtitle">
+          Upload multiple Excel files for asynchronous processing.
+        </p>
+      </header>
 
-      <p>
-        Upload multiple Excel files for asynchronous processing.
-      </p>
+      <DropZone
+        files={files}
+        dragActive={dragActive}
+        uploading={uploading}
+        selectionNotice={selectionNotice}
+        onDragOver={handleDragOver}
+        onDragLeave={handleDragLeave}
+        onDrop={handleDrop}
+        onFileChange={handleFileChange}
+        onRemoveFile={handleRemoveFile}
+        onClearFiles={handleClearFiles}
+        onUpload={handleUpload}
+      />
 
-      <section className="upload-card">
-        <input
-          type="file"
-          accept=".xlsx"
-          multiple
-          onChange={handleFileChange}
-          disabled={uploading}
-        />
-
-        <button
-          onClick={handleUpload}
-          disabled={!files.length || uploading}
-        >
-          {uploading ? "Uploading..." : "Upload Files"}
-        </button>
-      </section>
-
-      <section className="results">
-        <h2>Job History</h2>
-
-        <button
-          type="button"
-          onClick={loadJobHistory}
-          disabled={loadingHistory || uploading}
-        >
-          {loadingHistory
-            ? "Loading..."
-            : "Refresh All Jobs"}
-        </button>
-
-        {historyError && (
-          <p className="error">{historyError}</p>
-        )}
-
-        {results.length === 0 && !loadingHistory && (
-          <p>No jobs found.</p>
-        )}
-
-        {results.map((result) => (
-          <div
-            className="result-item"
-            key={result.jobId}
-          >
-            <div>
-              <strong>{result.filename}</strong>
-
-              <small>Job ID: {result.jobId}</small>
-
-              {result.validRows != null && (
-                <small>
-                  Valid rows: {result.validRows}
-                </small>
-              )}
-
-              {result.invalidRows != null && (
-                <small>
-                  Invalid rows: {result.invalidRows}
-                </small>
-              )}
-
-              {result.savedRecords != null && (
-                <small>
-                  Saved records: {result.savedRecords}
-                </small>
-              )}
-            </div>
-
-            <div>
-              <span>{result.status}</span>
-
-              {result.error && (
-                <small className="error">
-                  {result.error}
-                </small>
-              )}
-
-              {!result.isTemporary && (
-                <button
-                  type="button"
-                  disabled={result.refreshing}
-                  onClick={() =>
-                    handleRefreshStatus(result.jobId)
-                  }
-                >
-                  {result.refreshing
-                    ? "Refreshing..."
-                    : "Refresh Status"}
-                </button>
-              )}
-
-              {result.errorReportAvailable && (
-                <button
-                  type="button"
-                  disabled={result.downloading}
-                  onClick={() =>
-                    handleDownloadErrors(result.jobId)
-                  }
-                >
-                  {result.downloading
-                    ? "Preparing..."
-                    : "Download Error Report"}
-                </button>
-              )}
-            </div>
-          </div>
-        ))}
-      </section>
+      <JobList
+        results={results}
+        loadingHistory={loadingHistory}
+        historyError={historyError}
+        uploading={uploading}
+        onRefreshAll={loadJobHistory}
+        onRefreshStatus={handleRefreshStatus}
+        onDownloadErrors={handleDownloadErrors}
+      />
     </main>
   );
 }

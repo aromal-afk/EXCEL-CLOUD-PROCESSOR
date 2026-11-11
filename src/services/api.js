@@ -21,23 +21,71 @@ export async function createJob(filename) {
   return response.json();
 }
 
-// Upload Excel directly to Google Cloud Storage
-export async function uploadToGCS(file, uploadUrl, contentType) {
-  const response = await fetch(uploadUrl, {
-    method: "PUT",
-    headers: {
-      "Content-Type": contentType,
-    },
-    body: file,
-  });
+// Upload Excel directly to Google Cloud Storage.
+// Retries up to MAX_UPLOAD_ATTEMPTS times on transient failures
+// (network errors or 5xx responses) using exponential backoff.
+// A 409 Conflict (ifGenerationMatch=0 — object already exists)
+// is a permanent error and is never retried.
+const MAX_UPLOAD_ATTEMPTS = 3;
+const UPLOAD_RETRY_BASE_MS = 1000;
 
-  if (!response.ok) {
-    throw new Error(
-      `GCS upload failed: HTTP ${response.status}`
-    );
+export async function uploadToGCS(file, uploadUrl, contentType, onRetry) {
+  let lastError;
+
+  for (let attempt = 1; attempt <= MAX_UPLOAD_ATTEMPTS; attempt++) {
+    // Notify the caller on every retry (not the first attempt).
+    if (attempt > 1 && typeof onRetry === "function") {
+      onRetry(attempt, MAX_UPLOAD_ATTEMPTS);
+    }
+
+    try {
+      const response = await fetch(uploadUrl, {
+        method: "PUT",
+        headers: {
+          "Content-Type": contentType,
+        },
+        body: file,
+      });
+
+      if (response.ok) {
+        return true;
+      }
+
+      // 409 Conflict: the signed URL's ifGenerationMatch=0 guard fired,
+      // meaning the object already exists. Retrying won't help.
+      if (response.status === 409) {
+        throw new Error(
+          `GCS upload failed: object already exists (HTTP 409)`
+        );
+      }
+
+      // Any other non-OK status is treated as transient on the first
+      // two attempts, then surfaced as a permanent error on the last.
+      lastError = new Error(
+        `GCS upload failed: HTTP ${response.status} (attempt ${attempt}/${MAX_UPLOAD_ATTEMPTS})`
+      );
+    } catch (err) {
+      // Re-throw permanent errors immediately (409 or any error we
+      // explicitly threw above without setting lastError).
+      if (!lastError && err.message.includes("already exists")) {
+        throw err;
+      }
+
+      // Network-level error (fetch itself threw — offline, DNS, etc.)
+      lastError = lastError ?? new Error(
+        `GCS upload failed: ${err.message} (attempt ${attempt}/${MAX_UPLOAD_ATTEMPTS})`
+      );
+    }
+
+    if (attempt < MAX_UPLOAD_ATTEMPTS) {
+      // Exponential backoff: 1 s, 2 s before the 2nd and 3rd attempts.
+      await new Promise((resolve) =>
+        setTimeout(resolve, UPLOAD_RETRY_BASE_MS * 2 ** (attempt - 1))
+      );
+    }
   }
 
-  return true;
+  throw lastError;
 }
 
 // Confirm upload and queue the job for processing
